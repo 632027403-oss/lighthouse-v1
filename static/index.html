@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b0d10">
+<title>Lighthouse V1</title>
+<style>
+:root{font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#f5f7fa;background:#0b0d10}
+*{box-sizing:border-box}body{margin:0;background:#0b0d10}
+main{max-width:720px;margin:auto;padding:18px 14px 42px}
+h1{font-size:30px;margin:2px 0}.sub{color:#8f99a5;font-size:13px;margin-bottom:18px}
+.card{background:#15191f;border:1px solid #252b33;border-radius:16px;padding:14px;margin:10px 0}
+.row{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.badge{font-size:12px;padding:5px 9px;border-radius:999px;background:#252b33}
+.live{background:#173a27}.bad{background:#42232a}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
+.tile{background:#101318;border-radius:12px;padding:11px;min-width:0}
+.name{font-size:13px;color:#aeb7c2}.price{font-size:18px;font-weight:700;margin-top:5px;white-space:nowrap;overflow:hidden}
+.small{font-size:11px;color:#87919d;margin-top:5px;line-height:1.4}
+.section{margin-top:20px;font-weight:700}
+.note{font-size:12px;color:#aab2bd;line-height:1.55}
+.err{color:#e29aa2}
+footer{color:#68717c;font-size:11px;text-align:center;margin-top:22px}
+</style>
+</head>
+<body>
+<main>
+<h1>🔦 Lighthouse</h1>
+<div class="sub">V1 · 实时数据中枢</div>
+
+<div class="card">
+  <div class="row"><b>数据源状态</b><span id="overall" class="badge">连接中</span></div>
+  <div id="sources" class="small" style="margin-top:12px">正在建立连接…</div>
+</div>
+
+<div class="section">加密资产</div>
+<div id="crypto" class="grid"></div>
+
+<div class="section">美股</div>
+<div class="card">
+  <div id="stocks" class="grid"></div>
+  <div class="note" style="margin-top:10px">
+    这里不伪造实时行情。具备相应实时数据授权的供应商接入后再启用 AMD / MRVL / NVDA。
+  </div>
+</div>
+
+<div class="section">Lighthouse 判断层</div>
+<div class="card">
+  <div class="note">
+    <b>当前阶段：</b>先验证数据真实性、持续性和故障隔离。<br>
+    下一层将基于稳定数据启用历史相似样本、1/3/7/30/90 日条件统计、收益分布、最大回撤、样本外验证与证据融合。
+  </div>
+</div>
+<footer id="updated">—</footer>
+</main>
+
+<script>
+const f=(v)=>v==null?"—":Number(v).toLocaleString(undefined,{maximumFractionDigits:4});
+function sourceLine(name,v){
+  const live=["live","fallback_rest"].includes(v.status);
+  const badge=`<span class="badge ${live?"live":"bad"}">${live?"●":"○"} ${name.toUpperCase()}</span>`;
+  const err=v.error?`<div class="err">${v.error}</div>`:"";
+  return `<div style="margin:6px 0">${badge} <span>${v.status}</span>${err}</div>`;
+}
+function render(d){
+  document.getElementById("sources").innerHTML=
+    Object.entries(d.sources).map(([n,v])=>sourceLine(n,v)).join("");
+
+  const bases=["BTC","ETH","SOL"];
+  document.getElementById("crypto").innerHTML=bases.map(base=>{
+    const q=Object.values(d.quotes).filter(x=>x.base===base);
+    const newest=q.sort((a,b)=>(b.timestamp||0)-(a.timestamp||0))[0];
+    return `<div class="tile">
+      <div class="name">${base}</div>
+      <div class="price">${newest?f(newest.last):"—"}</div>
+      <div class="small">${newest?newest.exchange+" · "+newest.transport:"等待数据"}</div>
+    </div>`;
+  }).join("");
+
+  document.getElementById("stocks").innerHTML=["AMD","MRVL","NVDA"].map(s=>
+    `<div class="tile"><div class="name">${s}</div><div class="price">—</div><div class="small">待接入实时供应商</div></div>`
+  ).join("");
+
+  const active=Object.values(d.sources).filter(v=>["live","fallback_rest"].includes(v.status)).length;
+  const badge=document.getElementById("overall");
+  badge.textContent=`${active}/3 数据源可用`;
+  badge.className="badge "+(active===3?"live":active?"":"bad");
+  document.getElementById("updated").textContent=
+    "中枢时间："+new Date(d.ts||Date.now()).toLocaleTimeString();
+}
+async function tick(){
+  try{
+    const r=await fetch("/api/market",{cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    render(await r.json());
+  }catch(e){
+    document.getElementById("overall").textContent="服务连接异常";
+    document.getElementById("overall").className="badge bad";
+  }
+}
+tick();setInterval(tick,2000);
+</script>
+</body>
+</html>
