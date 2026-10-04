@@ -95,6 +95,19 @@ def max_drawdown(closes):
         if peak: dd=min(dd,(x-peak)/peak*100)
     return round(dd,2)
 
+def statistical_probability(stats):
+    """Historical-condition probability, never a model-only probability."""
+    if not isinstance(stats,dict) or stats.get("sample_count",0) < 20:
+        return None
+    weights={"1d":0.10,"3d":0.10,"7d":0.20,"30d":0.30,"90d":0.30}
+    vals=[]; ws=[]
+    for k,w in weights.items():
+        x=stats.get(k)
+        if isinstance(x,dict) and x.get("up_rate") is not None:
+            vals.append(float(x["up_rate"])); ws.append(w)
+    if not vals:return None
+    return round(sum(v*w for v,w in zip(vals,ws))/sum(ws),1)
+
 def similar_stats(rows, feature_fn, target_index=0):
     # rows: chronological close records with feature tuple and close
     if len(rows)<80: return {"sample_count":0,"status":"样本不足"}
@@ -161,7 +174,7 @@ async def okx_spot(c,s):
     d=(await json_get(c,f"{OKX}/api/v5/market/books",{"instId":inst,"sz":"50"}))["data"][0]
     bid=sum(float(x[0])*float(x[1]) for x in d["bids"]); ask=sum(float(x[0])*float(x[1]) for x in d["asks"])
     p=float(t["last"]); o=float(t["open24h"])
-    return {"price":p,"change24h":pct(p,o),"volume":float(t.get("volCcy24h",0)),
+    return {"available":True,"price":p,"change24h":pct(p,o),"volume":float(t.get("volCcy24h",0)),
             "book_buy":bid/(bid+ask) if bid+ask else .5,"updated":ts()}
 
 async def coinbase_spot(c,s):
@@ -169,7 +182,7 @@ async def coinbase_spot(c,s):
     t=await json_get(c,f"{COINBASE}/products/{product}/ticker")
     st=await json_get(c,f"{COINBASE}/products/{product}/stats")
     p=float(t["price"]); o=float(st["open"])
-    return {"price":p,"change24h":pct(p,o),"volume":float(st.get("volume",0)),
+    return {"available":True,"price":p,"change24h":pct(p,o),"volume":float(st.get("volume",0)),
             "updated":ts()}
 
 async def derivatives(c,s):
@@ -192,7 +205,7 @@ async def historical_crypto(c,s):
     if not k:
         inst=s.replace("USDT","-USDT")
         try:
-            x=await json_get(c,f"{OKX}/api/v5/market/candles",{"instId":inst,"bar":"1D","limit":"100"})
+            x=await json_get(c,f"{OKX}/api/v5/market/candles",{"instId":inst,"bar":"1D","limit":"300"})
             data=x.get("data",[])
             data=list(reversed(data))
             k=[[int(r[0]),0,0,0,float(r[4]),float(r[5]),0,float(r[7])] for r in data]
@@ -264,8 +277,9 @@ def regime_from_asset(src,deriv,hist,macro):
     return {"price":p,"change24h":round(safe_mean(changes) or 0,2),"buy_power":round(buy*100,1),
             "ret7":round(ret7,2),"ret30":round(ret30,2),"short":short,"mid":mid,
             "stage":"趋势形成/延续" if abs(ret30)>8 else "整理/待确认",
-            "score":score,"derivatives_combo":combo,
-            "funding":funding,"oi":oi,
+            "score":score,"stat_probability":statistical_probability(hist.get("stats",{}) if isinstance(hist,dict) else {}),
+            "probability_basis":"历史相似条件加权上涨率" if statistical_probability(hist.get("stats",{}) if isinstance(hist,dict) else {}) is not None else "历史相似样本不足",
+            "derivatives_combo":combo,"funding":funding,"oi":oi,
             "reversal_risk":"较高" if (ret7*ret30<0) else "中等" if abs(ret7)>4 else "中低"}
 
 async def fetch_farside(c):
@@ -401,8 +415,10 @@ async def scan_stocks(c,macro):
                 score=(st["ret30"] or 0)*0.7+(st["ret7"] or 0)*0.3
                 sim=st["stats"]
                 if sim.get("7d"):score+=(sim["7d"]["up_rate"]-50)*0.08
+                prob=statistical_probability(sim)
                 return {"ticker":ticker,"price":st["last"],"ret7":round(st["ret7"],2),
                         "ret30":round(st["ret30"],2),"score":round(score,2),
+                        "stat_probability":prob,"probability_basis":"历史相似条件加权上涨率" if prob is not None else "历史相似样本不足",
                         "stats":sim,"max_drawdown":st["max_drawdown"]}
             except Exception:
                 return None
@@ -411,7 +427,7 @@ async def scan_stocks(c,macro):
     top=out[:3]
     secvals=await asyncio.gather(*(sec_fundamentals(c,a["ticker"]) for a in top), return_exceptions=True)
     for a,s in zip(top,secvals): a["sec"]=s if isinstance(s,dict) else {"available":False,"status":"异常"}
-    return top
+    return out
 
 async def scan_asset(c,s):
     src={}
@@ -477,9 +493,9 @@ async def full_refresh():
         state["stock_rank"]=stocks
         state["macro"]=m;state["etf"]=etf;state["updated"]=ts()
         state["sources"]={
-            "Binance":any(a.get("sources",{}).get("binance") for a in crypto.values()),
-            "OKX":any(a.get("sources",{}).get("okx") for a in crypto.values()),
-            "Coinbase":any(a.get("sources",{}).get("coinbase") for a in crypto.values()),
+            "Binance":any(bool(a.get("sources",{}).get("binance",{}).get("available")) for a in crypto.values()),
+            "OKX":any(bool(a.get("sources",{}).get("okx",{}).get("available")) for a in crypto.values()),
+            "Coinbase":any(bool(a.get("sources",{}).get("coinbase",{}).get("available")) for a in crypto.values()),
             "BTC ETF / Farside":bool(etf.get("available")),
             "FRED/Fed":bool(m.get("Fed Funds")),
             "Treasury":bool(m.get("_treasury",{}).get("available")),
@@ -549,13 +565,13 @@ function render(x){
  const n=Object.values(x.sources||{}).filter(Boolean).length;
  $('status').textContent='最近更新 '+(x.updated?new Date(x.updated).toLocaleTimeString():'—');
  $('sources').innerHTML=Object.entries(x.sources||{}).map(([k,v])=>row(k,v?'可用':'暂缺')).join('');
- $('crypto').innerHTML=(x.crypto_rank||[]).slice(0,3).map((s,i)=>{let a=x.assets[s],r=a.regime||{},st=a.history?.stats||{};return `<div class="rank"><b>${i+1}. ${esc(s.replace('USDT',''))}</b> <span class="tag">${esc(r.mid)}</span>${row('价格','$'+Number(r.price||0).toLocaleString())}${row('短期',r.short)}${row('阶段',r.stage)}${row('证据优势',r.score)}${row('历史样本',st.sample_count||0)}</div>`}).join('');
- $('stocks').innerHTML=(x.stock_rank||[]).map((a,i)=>`<div class="rank"><b>${i+1}. ${esc(a.ticker)}</b> <span class="tag">历史证据排序</span>${row('价格','$'+Number(a.price||0).toLocaleString())}${row('7日',a.ret7+'%')}${row('30日',a.ret30+'%')}${row('历史样本',a.stats?.sample_count||0)}${a.sec?.available?row('SEC','已接入'):row('SEC','暂缺')}</div>`).join('');
+ $('crypto').innerHTML=(x.crypto_rank||[]).slice(0,3).map((s,i)=>{let a=x.assets[s],r=a.regime||{},st=a.history?.stats||{};return `<div class="rank"><b>${i+1}. ${esc(s.replace('USDT',''))}</b> <span class="tag">${esc(r.mid)}</span>${row('价格','$'+Number(r.price||0).toLocaleString())}${row('短期',r.short)}${row('阶段',r.stage)}${row('证据优势',r.score)}${row('统计概率',r.stat_probability==null?'样本不足':r.stat_probability+'%')}${row('历史样本',st.sample_count||0)}</div>`}).join('');
+ $('stocks').innerHTML=(x.stock_rank||[]).slice(0,3).map((a,i)=>`<div class="rank"><b>${i+1}. ${esc(a.ticker)}</b> <span class="tag">历史证据排序</span>${row('价格','$'+Number(a.price||0).toLocaleString())}${row('7日',a.ret7+'%')}${row('30日',a.ret30+'%')}${row('统计概率',a.stat_probability==null?'样本不足':a.stat_probability+'%')}${row('历史样本',a.stats?.sample_count||0)}${a.sec?.available?row('SEC','已接入'):row('SEC','暂缺')}</div>`).join('');
  $('macro').innerHTML=Object.entries(x.macro||{}).filter(([k])=>k!=='_treasury').map(([k,v])=>row(k,v?.value??'暂缺')).join('');
  const e=x.etf||{};$('etf').innerHTML=e.available?row('最近日',`${e.latest.date} · ${e.latest.total>0?'+':''}${e.latest.total} US$m`)+row('数据源','Farside'):row('状态','暂缺/异常');
 }
 async function load(){try{render(await fetch('/api/state',{cache:'no-store'}).then(r=>r.json()))}catch(e){$('status').textContent='连接异常'}}
-async function searchA(){let q=$('q').value.trim();if(!q)return;let d=await fetch('/api/search?symbol='+encodeURIComponent(q)).then(r=>r.json());$('detail').innerHTML='<div class="card"><h2>'+esc(q.toUpperCase())+'</h2>'+row('状态',d.status||'已找到')+(d.regime?row('中期',d.regime.mid)+row('短期',d.regime.short)+row('数据完整度',d.completeness+'/3')+row('统计样本',d.history?.stats?.sample_count||0)+row('最大回撤',d.history?.max_drawdown+'%'):'')+(d.stats?statBlock(d.stats):'')+(d.fusion?'<h3>正方证据</h3><ul>'+d.fusion.pro.map(z=>'<li>'+esc(z.name)+'：'+esc(z.detail)+'</li>').join('')+'</ul><h3>反方证据</h3><ul>'+d.fusion.counter.map(z=>'<li>'+esc(z.name)+'：'+esc(z.detail)+'</li>').join('')+'</ul>':'')+'</div>'}
+async function searchA(){let q=$('q').value.trim();if(!q)return;let d=await fetch('/api/search?symbol='+encodeURIComponent(q)).then(r=>r.json());$('detail').innerHTML='<div class="card"><h2>'+esc(q.toUpperCase())+'</h2>'+row('状态',d.status||'已找到')+(d.regime?row('中期',d.regime.mid)+row('短期',d.regime.short)+row('数据完整度',d.completeness+'/3')+row('统计样本',d.history?.stats?.sample_count||0)+row('最大回撤',d.history?.max_drawdown+'%'):'')+(d.stats?row('统计概率',d.stat_probability==null?'样本不足':d.stat_probability+'%')+statBlock(d.stats):'')+(d.fusion?'<h3>正方证据</h3><ul>'+d.fusion.pro.map(z=>'<li>'+esc(z.name)+'：'+esc(z.detail)+'</li>').join('')+'</ul><h3>反方证据</h3><ul>'+d.fusion.counter.map(z=>'<li>'+esc(z.name)+'：'+esc(z.detail)+'</li>').join('')+'</ul>':'')+'</div>'}
 load();setInterval(load,30000);
 </script></body></html>'''
 
