@@ -127,19 +127,33 @@ def similar_stats(rows, feature_fn, target_index=0):
     return out
 
 async def crypto_spot(c,s):
-    t,b,e=await first_json(c,BINANCE_SPOT,"/api/v3/ticker/24hr",{"symbol":s})
-    if not t: return None
-    d,_,_=await first_json(c,BINANCE_SPOT,"/api/v3/depth",{"symbol":s,"limit":50})
-    tr,_,_=await first_json(c,BINANCE_SPOT,"/api/v3/aggTrades",{"symbol":s,"limit":1000})
-    if not d or not tr: return None
-    bid=sum(float(x[0])*float(x[1]) for x in d.get("bids",[]))
-    ask=sum(float(x[0])*float(x[1]) for x in d.get("asks",[]))
-    buy=sum(float(x.get("q",0)) for x in tr if not x.get("m"))
-    sell=sum(float(x.get("q",0)) for x in tr if x.get("m"))
-    return {"price":float(t["lastPrice"]),"change24h":float(t["priceChangePercent"]),
-            "volume":float(t["quoteVolume"]),"book_buy":bid/(bid+ask) if bid+ask else .5,
-            "aggressive_buy":buy/(buy+sell) if buy+sell else .5,"endpoint":b,
-            "updated":ts()}
+    # Binance is the primary public spot source. Each endpoint is independent:
+    # a depth/trades failure must NOT erase a valid ticker price/volume result.
+    t,b,te=await first_json(c,BINANCE_SPOT,"/api/v3/ticker/24hr",{"symbol":s})
+    d,db,de=await first_json(c,BINANCE_SPOT,"/api/v3/depth",{"symbol":s,"limit":50})
+    tr,tb,tre=await first_json(c,BINANCE_SPOT,"/api/v3/aggTrades",{"symbol":s,"limit":1000})
+    if not t:
+        return {"available":False,"error":te or "ticker unavailable","endpoint":b or db or tb,
+                "ticker":False,"depth":False,"trades":False,"updated":ts()}
+    out={"available":True,"price":float(t["lastPrice"]),"change24h":float(t["priceChangePercent"]),
+         "volume":float(t["quoteVolume"]),"endpoint":b,"ticker":True,
+         "depth":False,"trades":False,"updated":ts()}
+    if d:
+        bid=sum(float(x[0])*float(x[1]) for x in d.get("bids",[]))
+        ask=sum(float(x[0])*float(x[1]) for x in d.get("asks",[]))
+        out["book_buy"]=bid/(bid+ask) if bid+ask else .5
+        out["depth"]=True
+    if tr:
+        buy=sum(float(x.get("q",0)) for x in tr if not x.get("m"))
+        sell=sum(float(x.get("q",0)) for x in tr if x.get("m"))
+        out["aggressive_buy"]=buy/(buy+sell) if buy+sell else .5
+        out["trades"]=True
+    errors=[]
+    if te: errors.append("ticker:"+te)
+    if de: errors.append("depth:"+de)
+    if tre: errors.append("trades:"+tre)
+    if errors: out["errors"]=errors
+    return out
 
 async def okx_spot(c,s):
     inst=s.replace("USDT","-USDT")
@@ -171,8 +185,20 @@ async def derivatives(c,s):
             "klines":kl,"endpoint":ob or fb or kb,"updated":ts()}
 
 async def historical_crypto(c,s):
+    # Prefer Binance daily candles; fall back to OKX daily candles so the
+    # statistical layer can still work when Binance is regionally blocked.
     k,b,e=await first_json(c,BINANCE_SPOT,"/api/v3/klines",{"symbol":s,"interval":"1d","limit":1000})
-    if not k: return None
+    source=b
+    if not k:
+        inst=s.replace("USDT","-USDT")
+        try:
+            x=await json_get(c,f"{OKX}/api/v5/market/candles",{"instId":inst,"bar":"1D","limit":"100"})
+            data=x.get("data",[])
+            data=list(reversed(data))
+            k=[[int(r[0]),0,0,0,float(r[4]),float(r[5]),0,float(r[7])] for r in data]
+            source=OKX
+        except Exception as ex:
+            return {"rows":[],"stats":{"sample_count":0,"status":"历史数据暂缺","error":str(ex)},"source":None}
     rows=[{"ts":int(x[0]),"close":float(x[4]),"volume":float(x[7])} for x in k]
     closes=[r["close"] for r in rows]
     def feat(r):
@@ -205,7 +231,7 @@ async def historical_crypto(c,s):
               "down_rate":round(sum(v<0 for v in x)/len(x)*100,1),"avg":round(statistics.mean(x),2),
               "median":round(statistics.median(x),2),"worst":round(min(x),2),"best":round(max(x),2)}
         out["status"]="有效" if sims else "历史相似样本不足"; return out
-    return {"rows":rows,"stats":sim(),"max_drawdown":max_drawdown(closes),"source":b}
+    return {"rows":rows,"stats":sim(),"max_drawdown":max_drawdown(closes),"source":source}
 
 def regime_from_asset(src,deriv,hist,macro):
     ps=[x["price"] for x in src.values() if x]
@@ -399,15 +425,17 @@ async def scan_asset(c,s):
     return {"symbol":s,"sources":src,"derivatives":{k:v for k,v in der.items() if k!="klines"},
             "history":hist or {},"regime":regime,
             "evidence":build_crypto_evidence(src,der,macro, hist),
-            "completeness":sum(bool(v) for v in src.values())}
+            "completeness":sum(bool(v and v.get("available",True)) for v in src.values())}
 
 def build_crypto_evidence(src,der,macro,hist):
     e=[]; counter=[]
     vals=[v for v in src.values() if v]
     if vals:
-        bp=safe_mean([v.get("aggressive_buy",v.get("book_buy",.5)) for v in vals])
-        e.append({"name":"多交易所现货行为","direction":"支持买方" if bp>.52 else "支持卖方" if bp<.48 else "中性",
-                  "detail":f"综合主动成交/盘口买方占比 {bp*100:.1f}%","independence":"交易所市场层"})
+        behavior=[v.get("aggressive_buy",v.get("book_buy")) for v in vals if v.get("aggressive_buy") is not None or v.get("book_buy") is not None]
+        bp=safe_mean(behavior)
+        if bp is not None:
+            e.append({"name":"多交易所现货行为","direction":"支持买方" if bp>.52 else "支持卖方" if bp<.48 else "中性",
+                      "detail":f"综合主动成交/盘口买方占比 {bp*100:.1f}%","independence":"交易所市场层"})
         disp=(max(v["price"] for v in vals)-min(v["price"] for v in vals))/statistics.median([v["price"] for v in vals])*100
         e.append({"name":"跨所价格一致性","direction":"一致" if disp<0.15 else "分歧","detail":f"价格离散 {disp:.3f}%","independence":"跨交易所"})
     if der.get("funding") is not None:
